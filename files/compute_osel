@@ -1,0 +1,207 @@
+#!/bin/bash
+#set -x
+
+#export PGUSER=osel
+#export PGPASSWORD=secret
+#export PGHOST=10.65.0.134
+#export PGPORT=5432
+#
+#TEMPLATE_PATH=/usr/lib/osel/template
+#KVM_XML_PATH=/usr/lib/osel/kvm/
+#OSEL_PATH=/usr/lib/osel
+#
+#
+#KVM_ID=d95276f4-1b34-11ea-9b78-52540012512e
+#PHYSNET=eth1
+#RBD_POOL=kvm
+#
+#PGSQL="/usr/bin/psql -P pager=off -d osel "
+if [ -f /etc/osel.conf ]
+then 
+	source /etc/osel.conf
+else
+	echo config file /etc/osel.conf missing
+	exit 1
+fi
+
+function check_network () {
+ # check if the openvswitch bridge exist - if not, it will be created and the vlan / vxlan uplink attached
+ NET=`$PGSQL -t -c "SELECT name,segmentation from network where id='$I_NET_ID'"`
+ export NET_NAME=`echo $NET | cut -d \| -f 1 | sed 's/ //g'`
+ NET_TYPE=`echo $NET | cut -d \| -f 2 | cut -d : -f 1 | sed 's/ //g'`
+ NET_SEG=`echo $NET | cut -d \| -f 2 | cut -d : -f 2 | sed 's/ //g'`
+ echo Net Name: $NET_NAME
+ echo Typ: $NET_TYPE
+ echo NET_SEG: $NET_SEG
+
+  if [ "$NET_TYPE" = "vlan" ]
+  then
+	 echo check interface
+	 NET_INTERFACE="vlan${NET_SEG}"
+	 if [ ! -f /etc/sysconfig/network/ifcfg-vlan${NET_SEG} ] 
+	 then
+		 cd $OSEL_PATH
+		 git pull
+		 echo add interface
+		 sed -e "s/PHYSNET/$PHYSNET/g" -e "s/SEG/$NET_SEG/g" $TEMPLATE_PATH/ifcfg-vlan > /etc/sysconfig/network/ifcfg-vlan${NET_SEG}
+		 ifup $NET_INTERFACE
+         fi
+  fi 
+ ovs-vsctl br-exists $NET_NAME
+ if [ $? -eq 2 ]
+ then
+	 echo adding bridge
+	 ovs-vsctl add-br $NET_NAME
+	 ovs-vsctl add-port $NET_NAME $NET_INTERFACE
+ fi
+}
+
+
+function git_sync() {
+cd $OSEL_PATH
+git pull
+git add -A
+git commit -m `hostname`
+git push
+}
+
+
+function create_instance () {
+ 
+ IFS=',' read -r -a array <<< "$1"
+ I_ID=${array[0]}
+ I_NET_ID=${array[1]}
+ I_TEMPLATE=${array[2]}
+ I_IMAGE=${array[3]}
+ I_IP=${array[4]}
+ I_MAC=${array[5]}
+ echo ID: $I_ID
+ echo NET: $I_NET_ID
+ echo IP: $I_IP
+ check_network $I_NET_ID
+ echo TEMPLATE: $I_TEMPLATE
+ echo IMAGE: $I_IMAGE
+ 
+ # Image check or create RBD Image from template
+ rbd -p $RBD_POOL ls | grep -q $I_ID
+ if [ $? -eq 1 ]  # Image not existing
+ then
+     rbd clone $I_IMAGE $RBD_POOL/$I_ID
+ fi
+ # create cloud-init config drive
+ mkdir /tmp/$I_ID
+ sed -e "s/IP/$I_IP/g" -e "s/INSTANCE_ID/$I_ID/g" $TEMPLATE_PATH/meta-data > /tmp/$I_ID/meta-data
+ cp $TEMPLATE_PATH/user-data /tmp/$I_ID/user-data
+ mkisofs -output /var/tmp/osel/$I_ID.iso -volid cidata -joliet -rock /tmp/$I_ID
+ if [ -d /tmp/$I_ID ]
+ then
+   rm -rf /tmp/$I_ID
+ fi
+ # create xml body 
+ sed -e "s/NAME/$I_ID/g" -e "s/NET/$NET_NAME/g" -e "s/MACADDRESS/$I_MAC/g" -e "s/RBDDEVICE/$RBD_POOL\/$I_ID/g" -e "s/CLOUD_INIT/$I_ID.iso/g"  $TEMPLATE_PATH/$I_TEMPLATE  > $KVM_XML_PATH/$I_ID.def
+ virsh define $KVM_XML_PATH/$I_ID.def
+ virsh dumpxml $I_ID > $KVM_XML_PATH/$I_ID.xml
+ virsh start $I_ID
+ $PGSQL -c "UPDATE instance set status='started' where id='$I_ID'"
+ git_sync
+}
+
+function delete_instance () {
+if [ "`virsh list --all | grep $1`" ]
+then
+	if [ "`virsh list --all | grep $i | grep running`" ]
+	then
+	  virsh destroy $1
+        fi
+         virsh undefine $i
+        rm $KVM_XML_PATH/$i.xml
+        rm $KVM_XML_PATH/$i.def
+	git_sync
+        rbd -p $RBD_POOL rm $1
+	$PGSQL -c "UPDATE instance set status='deleted', deleted=current_timestamp where id='$1'"
+	git_sync
+fi	
+}
+
+function start_instance () {
+ IFS=',' read -r -a array <<< "$1"
+ I_ID=${array[0]}
+ I_NET_ID=${array[1]}
+ I_TEMPLATE=${array[2]}
+ I_IMAGE=${array[3]}
+ I_IP=${array[4]}
+ I_MAC=${array[5]}
+ echo ID: $I_ID
+ echo NET: $I_NET_ID
+ echo IP: $I_IP
+ check_network $I_NET_ID
+ echo TEMPLATE: $I_TEMPLATE
+ echo IMAGE: $I_IMAGE
+ 
+ git_sync
+if [ "`virsh list --all | grep $I_ID`" ]
+then 
+	### instance already exist on node - just start
+	virsh start $I_ID
+        $PGSQL -c "UPDATE instance set status='started' where id='$I_ID'"
+else
+	#### instance has to be defined 
+	virsh define $KVM_XML_PATH/$I_ID.def
+        # create cloud-init config drive
+        mkdir /tmp/$I_ID
+        sed -e "s/IP/$I_IP/g" -e "s/INSTANCE_ID/$I_ID/g" $TEMPLATE_PATH/meta-data > /tmp/$I_ID/meta-data
+        cp $TEMPLATE_PATH/user-data /tmp/$I_ID/user-data
+        mkisofs -output /var/tmp/osel/$I_ID.iso -volid cidata -joliet -rock /tmp/$I_ID
+        if [ -d /tmp/$I_ID ]
+               then
+                rm -rf /tmp/$I_ID
+        fi 
+        check_network $I_NET_ID
+	 virsh start $I_ID
+        $PGSQL -c "UPDATE instance set status='started' where id='$I_ID'"
+fi
+}
+
+function stop_instance () {
+ if [ "`virsh list --all | grep $1`" ]
+ then
+	 echo stop instance $1
+	 virsh destroy $1
+        $PGSQL -c "UPDATE instance set status='stopped' where id='$1'"
+ fi
+}
+
+
+while true 
+do
+	### create instance
+	for i in `$PGSQL -c "COPY (SELECT id,network_id,template,image,ip,mac from instance where hypervisor_id='$KVM_ID' and status='new') TO STDOUT WITH CSV"| sed 's/ //g'`
+	do
+	 create_instance $i
+	echo ------------------------------------------------------------
+	done
+	### delete instance
+	for i in `$PGSQL -c "COPY (SELECT id from instance where hypervisor_id='$KVM_ID' and status='delete') TO STDOUT WITH CSV"| sed 's/ //g'`
+	do
+	 echo deleting $i
+	 delete_instance $i
+	echo ------------------------------------------------------------
+	done
+	### start instance
+	for i in `$PGSQL -c "COPY (SELECT id,network_id,template,image,ip,mac from instance where hypervisor_id='$KVM_ID' and status='start') TO STDOUT WITH CSV"| sed 's/ //g'`
+	do
+	 start_instance $i
+	echo ------------------------------------------------------------
+	done
+
+	### stop instance
+	for i in `$PGSQL -c "COPY (SELECT id from instance where hypervisor_id='$KVM_ID' and status='stop') TO STDOUT WITH CSV"| sed 's/ //g'`
+	do
+	 stop_instance $i
+	echo ------------------------------------------------------------
+	done
+
+	echo waiting 
+	sleep 10
+done
+

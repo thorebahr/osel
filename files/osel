@@ -1,0 +1,247 @@
+#!/bin/bash
+if [ -f /etc/osel.conf ]
+then
+	source /etc/osel.conf
+else
+	echo config file /etc/osel.conf missing
+fi
+#
+#export PGUSER=osel
+#export PGPASSWORD=secret
+#export PGHOST=10.65.0.134
+#export PGPORT=5432
+
+#PGSQL="/usr/bin/psql -P pager=off"
+
+while getopts "u:h?p:h:M:" opt; do
+   case "$opt" in
+   h|\?)
+     cat <<EOF
+Create new VM based on a template.
+usage:
+kim {option} command
+
+   command:
+      hypervisor_create <NAME>
+      tenant_create <NAME>
+      network_create <NAME>
+   options:
+      -u :  postgres user
+      -p :  postgres pw
+      -h :  postgres server
+
+EOF
+     exit 0
+   ;;
+   u)
+     export PGUSER=$OPTARG
+   ;;
+   p)
+     export PGPASSWORD=$OPTARG
+   ;;
+   h)
+     export PGHOST=$OPTARG
+   ;;
+   M)
+     echo "DEBUG: $OPTARG"
+   ;;
+  esac
+done
+
+shift $(($OPTIND - 1))
+
+[ "$1" = "--" ] && shift
+
+case "$1" in
+	hypervisor_create)
+	 echo "Create new hypervisor"
+	  TUID=`/usr/bin/uuidgen`
+	  $PGSQL -d osel -c "INSERT INTO hypervisor  VALUES ('$TUID', '$2',current_timestamp,0,0,40,64);"
+	 ;;
+	hypervisor_list)
+	 echo "list hypervisor"
+	 $PGSQL -d osel -c "SELECT * from hypervisor;" 
+	 ;;
+	tenant_create)
+          echo "create new tenant $2"
+	  TUID=`/usr/bin/uuidgen`
+	  $PGSQL -d osel -c "INSERT INTO tenant VALUES ('$TUID', '$2','12346587564', 4,512,1000);"
+	  ;;
+	tenant_list)
+	 echo "list hypervisor"
+	 $PGSQL -d osel -c "SELECT * from tenant;" 
+	 ;;
+	network_create)
+          echo "create new network $2"
+	  TUID=`/usr/bin/uuidgen`
+	  $PGSQL -d osel -c "INSERT INTO network VALUES ('$TUID', '$2','$3','$4');"
+	  ;;
+	network_list)
+	 echo "list network"
+	 $PGSQL -d osel -c "SELECT * from network;" 
+	 ;;
+	instance_list)
+	 echo "list instances"
+	 $PGSQL -d osel -c "SELECT id,name,status,created,deleted from instance;" 
+	 ;;
+	instance_start)
+	 echo "start instances"
+	 $PGSQL -d osel -c "update instance set status='start' where id='$2';" 
+	 ;;
+	instance_stop)
+	 echo "stop instances"
+	 $PGSQL -d osel -c "update instance set status='stop' where id='$2';" 
+	 ;;
+	instance_delete)
+	 echo "delete instances"
+	 $PGSQL -d osel -c "update instance set status='delete' where id='$2';" 
+	 ;;
+	schedule_cluster)
+	 shift
+	 while  [ $# -gt 0 ]
+	     do
+		 case "$1" in
+			 -n) 
+			   I_NAME=$2
+			   echo NAME=$I_NAME
+			   ;;
+			 -i) 
+			   I_IMAGE=$2
+			   echo IMAGE=$I_IMAGE
+			   ;;
+			 -T) 
+			   I_TENANT=$2
+			   echo TENANT=$I_TENANT
+			   ;;
+			 -m) 
+			   I_NUM_MASTER=$2
+			   echo number master=$I_NUM_MASTER
+			   ;;
+			 -w) 
+			   I_NUM_WORKER=$2
+			   echo number worker=$I_NUM_WORKER
+			   ;;
+			 -a) 
+			   I_IP=$2
+			   echo IP=$I_IP
+			   ;;
+			 -N) 
+			   I_NET=$2
+			   echo NET=$I_NET
+			   ;;
+			 help)
+			  echo "$0 schedule cluster -i IMAGE -T TENANT -m #NUM master nodes -w #NUM worker nodes -a SUBNET -N network_id"
+			  exit
+			  ;;
+			 *)
+	          esac
+		  shift
+	     done
+	  echo "schedule test"
+	  ## create master nodes
+	  O_TYPE='master'
+	  echo MASTERNODES:
+	  for z in `seq  -f %02g 1 $I_NUM_MASTER` ; do
+	    echo $z
+	    touch /tmp/$I_TENANT
+	    for i in `$PGSQL -d osel -c "COPY (SELECT id from hypervisor) TO STDOUT WITH CSV"` ; do
+		 NUM=`$PGSQL -d osel -c "COPY (SELECT count(id) from instance where (status='started' or status='new') and type='$O_TYPE' and tenant='$I_TENANT' and hypervisor_id='$i') TO STDOUT WITH CSV";`
+		 echo $NUM $i >> /tmp/$I_TENANT 
+	    done
+	    I_HYPER=`cat /tmp/$I_TENANT | sort -n | head -n 1 | cut -d \  -f 2`
+	    rm /tmp/$I_TENANT
+            I_MAC=`echo 52:54$(od -txC -An -N4 /dev/random|tr \  :)`
+	    echo selected hypervisor $I_HYPER
+            TUID=`/usr/bin/uuidgen`
+            $PGSQL -d osel -c "INSERT INTO instance VALUES ('$TUID', '${I_NAME}-m$z','$I_HYPER','$I_TENANT','master','$I_NET','master.xml','$I_IMAGE','new','${I_IP}.2${z}','$I_MAC',current_timestamp);"
+	    echo ----------------------------------------
+         done
+	  ## create worker nodes
+	  O_TYPE='worker'
+	  echo WORKERNODES:
+	  for z in `seq  -f %02g 1 $I_NUM_WORKER` ; do
+	    echo $z
+	    touch /tmp/$I_TENANT
+	    for i in `$PGSQL -d osel -c "COPY (SELECT id from hypervisor) TO STDOUT WITH CSV"` ; do
+		 NUM=`$PGSQL -d osel -c "COPY (SELECT count(id) from instance where (status='started' or status='new') and type='$O_TYPE' and tenant='$I_TENANT' and hypervisor_id='$i') TO STDOUT WITH CSV";`
+		 echo $NUM $i >> /tmp/$I_TENANT 
+	    done
+	    I_HYPER=`cat /tmp/$I_TENANT | sort -n | head -n 1 | cut -d \  -f 2`
+	    rm /tmp/$I_TENANT
+            I_MAC=`echo 52:54$(od -txC -An -N4 /dev/random|tr \  :)`
+	    echo selected hypervisor $I_HYPER
+            TUID=`/usr/bin/uuidgen`
+            $PGSQL -d osel -c "INSERT INTO instance VALUES ('$TUID', '${I_NAME}-w$z','$I_HYPER','$I_TENANT','worker','$I_NET','worker.xml','$I_IMAGE','new','${I_IP}.1${z}','$I_MAC',current_timestamp);"
+	    echo ----------------------------------------
+    done
+	 ;;
+	 #
+	 #
+	 #
+	 #
+	 instance_create)
+	 shift
+	 while  [ $# -gt 0 ]
+	     do
+		 case "$1" in
+			 -i) 
+			   I_IMAGE=$2
+			   echo IMAGE=$I_IMAGE
+			   ;;
+			 -T) 
+			   I_TENANT=$2
+			   echo TENANT=$I_TENANT
+			   ;;
+			 -n) 
+			   I_NAME=$2
+			   echo NAME=$I_NAME
+			   ;;
+			 -h) 
+			   I_HYPER=$2
+			   echo HYPERVISOR=$I_HYPER
+			   ;;
+			 -t) 
+			   I_TYPE=$2
+			   echo TYPE=$I_TYPE
+			   ;;
+			 -f) 
+			   I_TEMPLATE=$2
+			   echo TEMPLATE=$I_TEMPLATE
+			   ;;
+			 -a) 
+			   I_IP=$2
+			   echo IP=$I_IP
+			   ;;
+			 -m) 
+			   I_MAC=$2
+			   ;;
+			 -N) 
+			   I_NET=$2
+			   echo NET=$I_NET
+			   ;;
+			 help)
+			  echo "$0 instance_create -i IMAGE -T TENANT -n NAME -h HYPERVISOR -t type -f TEMPLATE -a IP -m MAC -N NETWORK"
+			  exit
+			  ;;
+			 *)
+	          esac
+		  shift
+	     done
+             TUID=`/usr/bin/uuidgen`
+	     if [ ! "$I_MAC" ]
+	     then 
+		     I_MAC=`echo 52:54$(od -txC -An -N4 /dev/random|tr \  :)`
+             fi
+             $PGSQL -d osel -c "INSERT INTO instance VALUES ('$TUID', '$I_NAME','$I_HYPER','$I_TENANT','$I_TYPE','$I_NET','$I_TEMPLATE','$I_IMAGE','new','$I_IP','$I_MAC',current_timestamp);"
+	 ;;
+	 #
+	 #
+	 #
+	 #
+	 #
+   	*)
+          echo "Usage: $0 -h "
+	  exit 1
+esac
+
+
